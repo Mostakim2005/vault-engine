@@ -1,114 +1,173 @@
-import {
-	Editor,
-	MarkdownView,
-	MarkdownFileInfo,
-	Modal,
-	Notice,
-	Plugin,
-} from 'obsidian';
-import {
-	DEFAULT_SETTINGS,
-	MyPluginSettings,
-	SampleSettingTab,
-} from './settings';
+import { Plugin, TFile, TFolder } from 'obsidian';
+import type { VaultEngineApi } from '@navigation-suite/contracts';
+import { VaultIndex } from './VaultIndex';
+import { ChangeBatcher, type FileChange } from './ChangeBatcher';
+import { createVaultFingerprint, IndexedDbCache } from './IndexedDbCache';
+import { SearchEngine } from './SearchEngine';
+import { VaultEngineService } from './VaultEngineService';
+import { PerformanceMetrics } from './PerformanceMetrics';
+import { TaskScheduler } from './TaskScheduler';
 
-// Remember to rename these classes and interfaces!
+const CACHE_SCHEMA_VERSION = 2;
 
-export default class MyPlugin extends Plugin {
-	settings!: MyPluginSettings;
+export default class VaultEnginePlugin extends Plugin {
+	private readonly index = new VaultIndex(this.app);
+	private cache: IndexedDbCache | null = null;
+	private readonly metrics = new PerformanceMetrics();
+	private readonly searchEngine = new SearchEngine(this.index);
+	private readonly service = new VaultEngineService(this.index, this.searchEngine);
+	private readonly batcher = new ChangeBatcher((changes) => this.applyChanges(changes));
+	private readonly scheduler = new TaskScheduler();
+	private persistQueued = false;
+	readonly api: VaultEngineApi = this.service;
+	private initialized = false;
 
-	async onload() {
-		await this.loadSettings();
 
-		// This creates an icon in the left ribbon.
-		this.addRibbonIcon('dice', 'Sample', (_evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
+	async onload(): Promise<void> {
+		this.cache = new IndexedDbCache(this.app.vault.getName());
+		this.registerVaultEvents();
+		await this.initialize();
+	}
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status bar text');
+	onunload(): void {
+		this.batcher.cancel();
+		this.scheduler.dispose();
+		this.cache?.close();
+	}
 
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-modal-simple',
-			name: 'Open modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			},
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'replace-selected',
-			name: 'Replace selected content',
-			editorCallback: (
-				editor: Editor,
-				_ctx: MarkdownView | MarkdownFileInfo,
-			) => {
-				editor.replaceSelection('Sample editor command');
-			},
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-modal-complex',
-			name: 'Open modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView =
-					this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
+	private registerVaultEvents(): void {
+		this.registerEvent(this.app.vault.on('create', (file) => {
+			if (file instanceof TFile) this.batcher.push({ type: 'create', file });
+			else if (file instanceof TFolder) {
+				this.index.upsertFolder(file);
+				this.schedulePersist('low');
+				this.service.emit('folder-changed');
+			}
+		}));
+		this.registerEvent(this.app.vault.on('modify', (file) => {
+			if (file instanceof TFile) this.batcher.push({ type: 'modify', file });
+		}));
+		this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
+			if (file instanceof TFile) this.batcher.push({ type: 'rename', file, oldPath });
+			else if (file instanceof TFolder) {
+				this.rebuildAfterFolderRename(file, oldPath);
+			}
+		}));
+		this.registerEvent(this.app.vault.on('delete', (file) => {
+			if (file instanceof TFile) this.batcher.push({ type: 'delete', path: file.path });
+			else if (file instanceof TFolder) {
+				this.index.removeFolder(file.path);
+				this.schedulePersist('low');
+				this.service.emit('folder-changed');
+			}
+		}));
+		this.registerEvent(this.app.metadataCache.on('changed', (file) => {
+			this.batcher.push({ type: 'modify', file });
+		}));
+	}
 
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
+	private async initialize(): Promise<void> {
+		if (this.initialized) return;
+		this.initialized = true;
+		const loaded = await this.tryRestoreCache();
+		if (!loaded) this.rebuildIndex();
+		this.service.emit('index-ready');
+	}
+
+	private async tryRestoreCache(): Promise<boolean> {
+		try {
+			const cache = this.cache;
+			if (!cache) return false;
+			const payload = await cache.load();
+			if (!payload || payload.schemaVersion !== CACHE_SCHEMA_VERSION) return false;
+			const currentFiles = this.app.vault.getAllLoadedFiles()
+				.filter((file): file is TFile => file instanceof TFile)
+				.map((file) => ({ path: file.path, stat: file.stat }));
+			if (currentFiles.length !== payload.files.length) return false;
+			if (createVaultFingerprint(currentFiles) !== payload.vaultFingerprint) return false;
+			this.index.restore(payload.files);
+			return true;
+		} catch (error) {
+			console.warn('Vault Engine: cache restore failed; rebuilding index.', error);
+			return false;
+		}
+	}
+
+	private rebuildIndex(): void {
+		this.metrics.measure('index.rebuild', () => this.index.rebuild());
+		this.schedulePersist('low');
+	}
+
+	private applyChanges(changes: readonly FileChange[]): void {
+		let changed = false;
+		for (const change of changes) {
+			switch (change.type) {
+				case 'create': {
+					this.index.upsert(change.file);
+					changed = true;
+					this.service.emit('file-updated');
+					break;
 				}
-				return false;
-			},
-		});
-
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(activeDocument, 'click', (_evt: MouseEvent) => {
-			new Notice('Click');
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(
-			window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000),
-		);
+				case 'modify': {
+					const previous = this.index.getIndexedFile(change.file.path);
+					this.index.upsert(change.file);
+					changed = true;
+					this.service.emit('file-updated');
+					if (previous && !this.sameValues(previous.tags, this.index.getIndexedFile(change.file.path)?.tags ?? [])) this.service.emit('tag-changed');
+					if (previous && !this.sameProperties(previous.properties, this.index.getIndexedFile(change.file.path)?.properties ?? [])) this.service.emit('property-changed');
+					break;
+				}
+				case 'rename':
+					this.index.move(change.oldPath, change.file);
+					changed = true;
+					this.service.emit('file-updated');
+					this.service.emit('folder-changed');
+					break;
+				case 'delete':
+					this.index.remove(change.path);
+					changed = true;
+					this.service.emit('file-removed');
+					break;
+			}
+		}
+		if (changed) this.schedulePersist(changes.length > 10 ? 'low' : 'normal');
 	}
 
-	onunload() {}
-
-	async loadSettings() {
-		this.settings = Object.assign(
-			{},
-			DEFAULT_SETTINGS,
-			(await this.loadData()) as Partial<MyPluginSettings>,
-		);
+	private rebuildAfterFolderRename(folder: TFolder, oldPath: string): void {
+		const renamed = this.index.renameFolder(oldPath, folder.path);
+		if (!renamed) {
+			this.index.upsertFolder(folder);
+		}
+		this.schedulePersist('low');
+		this.service.emit('folder-changed');
+		this.service.emit('file-updated');
 	}
 
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
-}
-
-class SampleModal extends Modal {
-	onOpen() {
-		const { contentEl } = this;
-		contentEl.setText('Woah!');
+	private sameValues(left: readonly string[], right: readonly string[]): boolean {
+		return left.length === right.length && left.every((value, index) => value === right[index]);
 	}
 
-	onClose() {
-		const { contentEl } = this;
-		contentEl.empty();
+	private sameProperties(left: readonly { key: string; value: string }[], right: readonly { key: string; value: string }[]): boolean {
+		return left.length === right.length && left.every((value, index) => value.key === right[index]?.key && value.value === right[index]?.value);
+	}
+
+	private schedulePersist(priority: 'normal' | 'low'): void {
+		if (this.persistQueued) return;
+		this.persistQueued = true;
+		this.scheduler.schedule(async () => {
+			this.persistQueued = false;
+			await this.persistIndex();
+		}, priority);
+	}
+
+	private async persistIndex(): Promise<void> {
+		try {
+			const files = this.app.vault.getAllLoadedFiles().filter((file): file is TFile => file instanceof TFile).map((file) => ({ path: file.path, stat: file.stat }));
+			const cache = this.cache;
+			if (!cache) return;
+			await cache.save({ schemaVersion: CACHE_SCHEMA_VERSION, files: this.index.serialize(), vaultFingerprint: createVaultFingerprint(files) });
+		} catch (error) {
+			console.warn('Vault Engine: cache save failed.', error);
+		}
 	}
 }

@@ -1,11 +1,9 @@
 {
-	"id": "sample-plugin",
-	"name": "Sample Plugin",
-	"version": "1.0.0",
-	"minAppVersion": "1.0.0",
-	"description": "Demonstrates some of the capabilities of the Obsidian API.",
-	"author": "Obsidian",
-	"authorUrl": "https://obsidian.md",
-	"fundingUrl": "https://obsidian.md/pricing",
-	"isDesktopOnly": false
+  "id": "vault-engine",
+  "name": "Vault Engine",
+  "version": "0.3.0",
+  "minAppVersion": "1.8.0",
+  "description": "Incremental vault indexing, caching, metadata, and search engine.",
+  "author": "Navigation Suite",
+  "isDesktopOnly": false
 }

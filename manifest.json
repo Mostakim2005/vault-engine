@@ -1,4 +1,4 @@
-{
+﻿{
   "id": "vault-engine",
   "name": "Vault Engine",
   "version": "0.3.0",
@@ -7,3 +7,4 @@
   "author": "Navigation Suite",
   "isDesktopOnly": false
 }
+

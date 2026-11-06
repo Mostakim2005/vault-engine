@@ -1,4 +1,4 @@
-{
+﻿{
 	"name": "obsidian-sample-plugin",
 	"version": "1.0.0",
 	"description": "This is a sample plugin for Obsidian (https://obsidian.md)",
@@ -25,3 +25,4 @@
 		"typescript-eslint": "^8.59.1"
 	}
 }
+
